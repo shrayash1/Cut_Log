@@ -135,6 +135,16 @@ svg text{fill:var(--muted);font-family:var(--body);font-size:11px}
 .stotal{font-family:var(--display);font-size:20px;font-weight:600}
 .stotal small{font-family:var(--body);font-size:13px;color:var(--muted);font-weight:400}
 .sq{background:var(--accent-soft);border-radius:8px;padding:8px 10px;font-size:13px}
+.chatlog{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto}
+.msg{max-width:88%;padding:8px 12px;border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.msg.me{align-self:flex-end;background:var(--ink);color:var(--bg)}
+.msg.ai{align-self:flex-start;background:var(--bg);border:1px solid var(--line)}
+.msg.wait{color:var(--muted)}
+.chatideas .chip{text-align:left}
+#chatIn{font-size:16px}
+.chatfoot{display:flex;gap:10px;align-items:flex-start}
+.chatfoot .small{flex:1;min-width:0}
+.chatfoot .ghost{flex:none;padding:4px 10px;font-size:13px}
 @media (max-width:420px){
   .sitem{grid-template-columns:repeat(3,1fr)}
   .sitem .x{justify-self:end}
@@ -276,6 +286,25 @@ svg text{fill:var(--muted);font-family:var(--body);font-size:11px}
   <section class="panel">
     <h2>Eaten</h2>
     <div class="meals" id="meals"></div>
+  </section>
+
+  <section class="panel" id="chatPanel">
+    <h2>Ask your coach</h2>
+    <div class="chatlog" id="chatLog" hidden></div>
+    <div class="chips chatideas" id="chatIdeas">
+      <button type="button" class="chip">What should I eat to hit protein today?</button>
+      <button type="button" class="chip">How is my week going?</button>
+      <button type="button" class="chip">Am I on pace for my goal weight?</button>
+    </div>
+    <form class="lk" id="chatForm">
+      <input type="text" id="chatIn" placeholder="Ask about your log, meals or the cut" aria-label="Message to Claude" autocomplete="off">
+      <button class="primary" type="submit" id="chatSend">Send</button>
+      <button class="ghost" type="button" id="chatStop" hidden>Stop</button>
+    </form>
+    <div class="chatfoot">
+      <div class="small" id="chatStatus" role="status"></div>
+      <button class="ghost" type="button" id="chatClear" hidden>Clear chat</button>
+    </div>
   </section>
 
   <section class="panel">
@@ -600,7 +629,73 @@ $("lkAdd").onclick=()=>{
 $("lkCancel").onclick=()=>{lkCtl?.abort();$("lkIn").value="";lkReset()};
 (async()=>{try{sampleFn=await window.claude?.use?.("sample")}catch(e){sampleFn=null}
   if(!sampleFn)lkStatus("Lookup isn't available in this view. Use “+ Add something else” and type the numbers.",true);
+  if(!sampleFn)chatStatus("Chat isn't available in this view. Open Cut Log from your own claude.ai account.",true);
   snapReady()})();
+
+// ---- Coach chat (asks Claude, with the log as context) ----
+// Claude remembers nothing between calls: every send carries a fresh snapshot of the log plus the recent turns.
+let chatTurns=[],chatCtl=null,chatBusy=false;
+const CHAT_KEY="cutlog.chat.v1";
+const CHAT_DEFAULT="Claude sees your targets and the last 30 days of this log. It can't change the log.";
+try{const s=JSON.parse(localStorage.getItem(CHAT_KEY)||"[]");
+  if(Array.isArray(s))chatTurns=s.filter(t=>t&&(t.role==="user"||t.role==="assistant")&&typeof t.content==="string"&&t.content).slice(-30)}catch(e){}
+function chatStore(){try{localStorage.setItem(CHAT_KEY,JSON.stringify(chatTurns.slice(-30)))}catch(e){}}
+function chatStatus(t,err){const s=$("chatStatus");s.textContent=t||CHAT_DEFAULT;s.classList.toggle("lkstatus-err",!!err)}
+function chatBubble(role,text){const b=document.createElement("div");b.className="msg "+(role==="user"?"me":"ai");b.textContent=text;$("chatLog").appendChild(b);return b}
+function chatScroll(){const l=$("chatLog");l.scrollTop=l.scrollHeight}
+function renderChat(){const l=$("chatLog");l.innerHTML="";chatTurns.forEach(t=>chatBubble(t.role,t.content));
+  l.hidden=!chatTurns.length;$("chatIdeas").hidden=!!chatTurns.length;$("chatClear").hidden=!chatTurns.length||chatBusy;chatScroll()}
+function chatContext(){
+  const G=T(),t=TODAY(),now=new Date();
+  const mealLines=s=>(day(s).meals||[]).map(m=>"- "+m.name+": "+m.protein+" g protein, "+m.kcal+" kcal"+
+    (MAC.some(x=>has(m,x))?", carbs "+(+m.carbs||0)+" g, fat "+(+m.fat||0)+" g, fiber "+(+m.fiber||0)+" g":"")).join("\n")||"(nothing logged)";
+  const hist=[];
+  for(let i=0;i<30;i++){const s=addDays(t,-i),d=days[s];if(!d)continue;const x=totals(d),p=[s+(i?"":" (today)")];
+    p.push((d.meals||[]).length?"protein "+x.p+" g, "+x.k+" kcal, carbs "+x.c+" g, fat "+x.f+" g, fiber "+x.fb+" g":"no food logged");
+    if(d.weight)p.push("weight "+d.weight+" kg");if(d.waist)p.push("waist "+d.waist+" cm");
+    if(d.training)p.push(d.training==="gym"?"gym day":"rest day");hist.push(p.join("; "))}
+  const dayBlocks=[t,addDays(t,-1)].concat(cur!==t&&cur!==addDays(t,-1)?[cur]:[]).map(s=>"Food on "+s+(s===t?" (today)":"")+":\n"+mealLines(s)).join("\n\n");
+  return "You are the coach built into Cut Log, one person's fat-loss tracker. They are cutting from "+cfg.startWeight+" kg to "+cfg.goalWeight+" kg, "+
+    "mostly eat home-cooked Nepali food (rice, dal, tarkari, chicken curry, eggs, roti) and train at a gym.\n\n"+
+    "Rules:\n- Answer from the log below and use its numbers. Never invent entries; if the log doesn't show something, say so.\n"+
+    "- Be direct and brief: under 120 words unless they ask for more. Plain text only, no Markdown, no headings; short lines or hyphen lists are fine.\n"+
+    "- When you suggest food, give a portion and rough protein and kcal for it.\n"+
+    "- Judge weight by the trend across several weigh-ins, not one day.\n"+
+    "- You cannot change the log. To log food they use Snap a meal, Look up or Quick add on this page.\n"+
+    "- You are not a doctor. For injuries, medication, or eating far below their calorie target, tell them to check with one.\n\n"+
+    "Now: "+now.toLocaleString(undefined,{weekday:"long",hour:"numeric",minute:"2-digit"})+", "+t+".\n"+
+    "Daily targets: protein "+G.protein+" g (minimum), "+G.kcal+" kcal (ceiling), fat "+G.fat+" g (ceiling), fiber "+G.fiber+" g (minimum).\n\n"+
+    dayBlocks+"\n\nDay by day, newest first (days with nothing recorded are left out):\n"+(hist.join("\n")||"(no days recorded yet)")+"\n\n"+
+    "Their quick-add foods: "+(cfg.presets.map(p=>p.name+" ("+p.protein+" g protein, "+p.kcal+" kcal)").join("; ")||"none")+".";
+}
+async function chatSend(text){
+  text=String(text||"").trim();if(!text||chatBusy)return;
+  if(!sampleFn){chatStatus("Chat isn't available in this view. Open Cut Log from your own claude.ai account.",true);return}
+  chatBusy=true;chatCtl=new AbortController();
+  chatTurns.push({role:"user",content:text});renderChat();
+  const b=chatBubble("assistant","Thinking…");b.classList.add("wait");chatScroll();
+  $("chatIn").value="";$("chatSend").hidden=true;$("chatStop").hidden=false;chatStatus("");
+  const keep=r=>{chatTurns.push({role:"assistant",content:r});chatStore()};
+  try{
+    const r=await sampleFn([{role:"user",content:chatContext()},...chatTurns.slice(-16)],{cache:false,signal:chatCtl.signal,
+      onText:({text})=>{b.classList.remove("wait");b.textContent=text;chatScroll()}});
+    keep(r.text);if(r.truncated)chatStatus("That answer was cut short. Ask for less at a time.");
+  }catch(e){
+    const c=e&&e.code,part=c!=="refused"&&e&&typeof e.text==="string"&&e.text.trim()?e.text:"";
+    if(part)keep(part);else{chatTurns.pop();$("chatIn").value=text}
+    if(c==="cancelled")chatStatus("");
+    else if(c==="not_granted")chatStatus("Chat needs your permission to ask Claude. Allow it from the artifact's Permissions menu.",true);
+    else if(c==="rate_limited")chatStatus("Too many questions just now, or you've reached your Claude usage limit. Try again later.",true);
+    else if(c==="session_expired")chatStatus("Sign in to Claude again, then send your question.",true);
+    else if(c==="refused")chatStatus("Claude declined that one. Try asking it differently.",true);
+    else chatStatus(part?"The answer was interrupted. Send again for a full one.":"Couldn't get an answer just now. Tap Send to try again.",true);
+  }finally{chatBusy=false;chatCtl=null;$("chatSend").hidden=false;$("chatStop").hidden=true;renderChat()}
+}
+$("chatForm").addEventListener("submit",e=>{e.preventDefault();chatSend($("chatIn").value)});
+$("chatStop").onclick=()=>chatCtl?.abort();
+$("chatIdeas").addEventListener("click",e=>{const b=e.target.closest("button");if(b)chatSend(b.textContent)});
+$("chatClear").onclick=()=>{if(chatBusy)return;chatTurns=[];chatStore();renderChat();chatStatus("")};
+renderChat();chatStatus("");
 
 // ---- Snap a meal (photo → Claude estimates each item) ----
 let snapBlob=null,snapUrl=null,snapCtl=null,snapItems=[],snapImgOK=false;
