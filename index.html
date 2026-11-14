@@ -141,7 +141,9 @@ svg text{fill:var(--muted);font-family:var(--body);font-size:11px}
 .msg.ai{align-self:flex-start;background:var(--bg);border:1px solid var(--line)}
 .msg.wait{color:var(--muted)}
 .chatideas .chip{text-align:left}
-#chatIn{font-size:16px}
+#chatIn,#snapChatIn{font-size:16px}
+.snapchat{display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:12px}
+.snapchat .chatlog{max-height:260px}
 .chatfoot{display:flex;gap:10px;align-items:flex-start}
 .chatfoot .small{flex:1;min-width:0}
 .chatfoot .ghost{flex:none;padding:4px 10px;font-size:13px}
@@ -229,8 +231,15 @@ svg text{fill:var(--muted);font-family:var(--body);font-size:11px}
     <div class="small" id="snapStatus">Take a photo of your plate. Claude names each item and estimates the macros, and you can fix them before logging. Dinner gets copied to tomorrow's lunch.</div>
     <div id="snapRes" hidden style="display:flex;flex-direction:column;gap:10px">
       <div id="snapItems"></div>
-      <div class="sq" id="snapQ" hidden></div>
       <div class="stotal" id="snapTotal"></div>
+      <div class="snapchat">
+        <div class="chatlog" id="snapChat" hidden></div>
+        <form class="lk" id="snapChatForm">
+          <input type="text" id="snapChatIn" placeholder="Tell Claude more, e.g. rice was 2 cups, no oil" aria-label="More detail about this meal" autocomplete="off">
+          <button class="primary" type="submit" id="snapChatSend">Send</button>
+        </form>
+        <div class="small">Reply here and Claude updates the items above. Numbers you fixed by hand are kept unless your message changes them.</div>
+      </div>
       <div class="row">
         <button class="primary" type="button" id="snapAdd">Add to log</button>
         <button class="ghost" type="button" id="snapMore">+ Item</button>
@@ -721,7 +730,7 @@ function shrink(file){return new Promise(res=>{
   img.onerror=()=>{URL.revokeObjectURL(url);res(file)};img.src=url})}
 async function onPick(e){
   const f=e.target.files&&e.target.files[0];e.target.value="";if(!f)return;
-  snapCtl?.abort();$("snapRes").hidden=true;
+  snapCtl?.abort();$("snapRes").hidden=true;snapChatReset();
   snapBlob=await shrink(f);
   if(snapUrl)URL.revokeObjectURL(snapUrl);snapUrl=URL.createObjectURL(snapBlob);
   $("snapImg").src=snapUrl;$("snapPrev").hidden=false;
@@ -730,13 +739,13 @@ async function onPick(e){
 }
 $("snapCam").addEventListener("change",onPick);$("snapGal").addEventListener("change",onPick);
 function snapClear(){snapCtl?.abort();snapBlob=null;if(snapUrl)URL.revokeObjectURL(snapUrl);snapUrl=null;
-  $("snapPrev").hidden=true;$("snapRes").hidden=true;$("snapNote").value="";snapItems=[];snapStatus(SNAP_DEFAULT)}
+  $("snapPrev").hidden=true;$("snapRes").hidden=true;$("snapNote").value="";snapItems=[];snapChatReset();snapStatus(SNAP_DEFAULT)}
 $("snapClear").onclick=snapClear;
 $("snapGo").onclick=async()=>{
   if(!snapBlob)return;
   if(!sampleFn||!snapImgOK){snapStatus("Photo estimates aren't available in this view. Use Look up below instead.",true);return}
   snapCtl?.abort();snapCtl=new AbortController();
-  const btn=$("snapGo");btn.disabled=true;btn.textContent="Looking…";$("snapRes").hidden=true;
+  const btn=$("snapGo");btn.disabled=true;btn.textContent="Looking…";$("snapRes").hidden=true;snapChatReset();
   snapStatus("Claude is looking at your plate… (up to a minute)");
   const noteTxt=$("snapNote").value.trim().replace(/"/g,"'");
   const prompt=`You are a careful nutrition estimator for someone on a fat-loss cut (high protein). Look at the attached meal photo (${mealType.toLowerCase()}) and estimate the nutrition of everything on the plate/in the bowl that will be eaten.\n\n`+
@@ -746,14 +755,11 @@ $("snapGo").onclick=async()=>{
     `Reply with ONLY a JSON object, no prose:\n{"items":[{"name": string (short, e.g. "White rice"), "portion": string (e.g. "1.5 cups cooked"), "protein": number g, "kcal": number, "carbs": number g, "fat": number g, "fiber": number g}], "confidence":"high"|"medium"|"low", "question": string or "" }`;
   try{
     const r=await sampleFn.json(prompt,{images:[snapBlob],signal:snapCtl.signal,modelTier:"default"});
-    const items=(r&&Array.isArray(r.items)?r.items:[]).map(it=>({
-      name:String((it.name||"Food")+(it.portion?", "+it.portion:"")).slice(0,100),
-      protein:num(it.protein,10)??0,kcal:Math.round(num(it.kcal)??0),
-      carbs:num(it.carbs,10)??0,fat:num(it.fat,10)??0,fiber:num(it.fiber,10)??0}));
+    const items=snapMap(r);
     const q=r&&typeof r.question==="string"?r.question.trim().slice(0,240):"";
     if(!items.length){snapStatus(q||"Couldn't spot any food in that photo. Try again closer, from above.",true);return}
     snapItems=items;renderSnap();
-    $("snapQ").hidden=!q;$("snapQ").textContent=q?"Claude asks: "+q+" Add the answer to the note and tap Estimate again, or just fix the numbers.":"";
+    if(q)snapSay("assistant",q);
     const conf=["high","medium","low"].includes(r.confidence)?r.confidence:"medium";
     $("snapRes").hidden=false;
     snapStatus("Confidence: "+conf+". Photo estimates can be off by 20–30%, mostly from oil and rice amounts. Fix anything you know.");
@@ -765,6 +771,58 @@ $("snapGo").onclick=async()=>{
     else snapStatus("Couldn't get an estimate from that photo. Try again, or add a note like “2 cups rice, chicken curry”.",true);
   }finally{btn.disabled=false;btn.textContent="Estimate"}
 };
+// ---- Chat about the photo: more detail from the eater, Claude updates the items ----
+// Claude keeps nothing between calls, so each message re-sends the photo, the chat so far and the items on screen.
+let snapTurns=[],snapBusy=false;
+function snapMap(r){return(r&&Array.isArray(r.items)?r.items:[]).map(it=>({
+  name:String((it.name||"Food")+(it.portion?", "+it.portion:"")).slice(0,100),
+  protein:num(it.protein,10)??0,kcal:Math.round(num(it.kcal)??0),
+  carbs:num(it.carbs,10)??0,fat:num(it.fat,10)??0,fiber:num(it.fiber,10)??0}))}
+function snapBubble(role,text){const b=document.createElement("div");b.className="msg "+(role==="user"?"me":"ai");b.textContent=text;
+  const l=$("snapChat");l.appendChild(b);l.hidden=false;l.scrollTop=l.scrollHeight;return b}
+function snapSay(role,text){snapTurns.push({role,content:text});return snapBubble(role,text)}
+function snapChatReset(){snapTurns=[];const l=$("snapChat");l.innerHTML="";l.hidden=true;$("snapChatIn").value=""}
+$("snapChatForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const msg=$("snapChatIn").value.trim();if(!msg||snapBusy||!snapBlob)return;
+  if(!sampleFn||!snapImgOK){snapStatus("Photo estimates aren't available in this view. Fix the numbers by hand instead.",true);return}
+  snapBusy=true;snapCtl?.abort();const ctl=snapCtl=new AbortController();
+  const q1=s=>String(s).replace(/"/g,"'");
+  const before=snapTurns.map(t=>(t.role==="user"?"Eater":"You")+": "+t.content).join("\n");
+  const noteTxt=q1($("snapNote").value.trim());
+  const shown=snapItems.map(i=>({name:i.name,protein:i.protein,kcal:i.kcal,carbs:i.carbs,fat:i.fat,fiber:i.fiber}));
+  const mine=snapSay("user",msg);$("snapChatIn").value="";
+  const wait=snapBubble("assistant","Updating…");wait.classList.add("wait");
+  const btn=$("snapChatSend");btn.disabled=true;
+  const prompt=`You are a careful nutrition estimator for someone on a fat-loss cut (high protein). The attached photo is their ${mealType.toLowerCase()}. You already estimated it, and they are now giving you more detail in a chat so you can correct the estimate.\n\n`+
+    `Context: they usually eat home-cooked Nepali food (rice, dal, tarkari, achar, chicken curry, choila, soya chunks, eggs, roti).\n\n`+
+    (noteTxt?`Their first note about the meal: "${noteTxt}"\n\n`:"")+
+    (before?`Chat so far:\n${before}\n\n`:"")+
+    `Items now on their screen (they may have fixed numbers by hand; keep those unless the new message changes them):\n${JSON.stringify(shown)}\n\n`+
+    `Their new message: "${q1(msg)}"\n\n`+
+    `Rules:\n- Trust what they tell you over what the photo seems to show, for amounts and ingredients.\n- Change only what their message affects. You may add, remove, split or merge items. Return the full updated list, not only the changed items.\n`+
+    `- Use USDA FoodData Central values for generic foods and the brand label for packaged ones. Cooked values for cooked food; include cooking oil inside the dish it's in.\n`+
+    `- Do not invent precision. If they only ask a question, answer it and return the items unchanged.\n`+
+    `- "reply" is one or two short plain sentences: what you changed and by roughly how much, or the answer to their question. Add one short follow-up question only if something that matters is still unclear.\n\n`+
+    `Reply with ONLY a JSON object, no prose:\n{"items":[{"name": string (short food name with its amount, e.g. "White rice, 2 cups cooked"), "protein": number g, "kcal": number, "carbs": number g, "fat": number g, "fiber": number g}], "confidence":"high"|"medium"|"low", "reply": string}`;
+  try{
+    const r=await sampleFn.json(prompt,{images:[snapBlob],signal:ctl.signal,modelTier:"default",cache:false});
+    const items=snapMap(r),reply=r&&typeof r.reply==="string"?r.reply.trim().slice(0,400):"";
+    wait.remove();
+    if(items.length){snapItems=items;renderSnap()}
+    snapSay("assistant",reply||(items.length?"Updated the items above.":"I couldn't work that into the estimate. Try saying it another way."));
+    const conf=["high","medium","low"].includes(r&&r.confidence)?r.confidence:"medium";
+    snapStatus("Confidence: "+conf+". Check the items, then add them to your log.");
+  }catch(err){
+    wait.remove();mine.remove();if(snapTurns[snapTurns.length-1]?.content===msg)snapTurns.pop();
+    if(!$("snapChat").children.length)$("snapChat").hidden=true;
+    const c=err&&err.code;
+    if(c!=="cancelled"){$("snapChatIn").value=msg;
+      if(c==="not_granted")snapStatus("This needs your permission to ask Claude. Allow it from the artifact's Permissions menu.",true);
+      else if(c==="rate_limited")snapStatus("Too many estimates just now. Wait a minute and send again.",true);
+      else snapStatus("Couldn't update the estimate just now. Tap Send to try again, or fix the numbers by hand.",true)}
+  }finally{snapBusy=false;btn.disabled=false}
+});
 const SF=[["protein","Protein g"],["kcal","kcal"],["carbs","Carbs g"],["fat","Fat g"],["fiber","Fiber g"]];
 function snapTotal(){const t=snapItems.reduce((a,i)=>{SF.forEach(([k])=>a[k]+=+i[k]||0);return a},{protein:0,kcal:0,carbs:0,fat:0,fiber:0});
   $("snapTotal").innerHTML=r1(t.protein)+" g protein · "+Math.round(t.kcal)+" kcal <small>C "+Math.round(t.carbs)+" · F "+Math.round(t.fat)+" · Fiber "+Math.round(t.fiber)+" g</small>"}
